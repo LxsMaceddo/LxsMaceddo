@@ -1,0 +1,1469 @@
+--!strict
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local EggOpenResult = remotes:WaitForChild("EggOpenResult") :: RemoteEvent
+local EggOpenFeedback = remotes:WaitForChild("EggOpenFeedback") :: RemoteEvent
+local GetCurrencies = remotes:WaitForChild("GetCurrencies") :: RemoteFunction
+
+local EggCatalog = require(ReplicatedStorage:WaitForChild("EggCatalog"))
+local PetCatalog = require(ReplicatedStorage:WaitForChild("PetCatalog"))
+
+local UI = {
+	ToastDuration = 2.1,
+} :: {[string]: number}
+
+type HatchPayload = {
+	EggId: string,
+	EggDisplayName: string,
+	EggImageId: string,
+	PetName: string,
+	PetDisplayName: string,
+	PetIconId: string,
+	PetVariant: string,
+	PetPowerMode: string,
+	PetRarity: string,
+	PetRarityColor: Color3,
+	PowerPreview: string?,
+	Hatch: {[string]: any},
+}
+
+type PreviewSlotBinding = {
+	SortIndex: number,
+	Root: GuiObject,
+	Icon: GuiObject,
+	ChanceLabel: GuiObject?,
+}
+
+type PromptPreviewBinding = {
+	Gui: BillboardGui,
+	TitleLabel: TextLabel?,
+	PriceLabel: TextLabel?,
+	Slots: {PreviewSlotBinding},
+}
+
+local activePrompt: ProximityPrompt? = nil
+local resultQueue: {HatchPayload} = {}
+local playingHatch = false
+local previewByPrompt: {[ProximityPrompt]: PromptPreviewBinding} = {}
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "EggClientGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 970
+gui.Parent = playerGui
+
+local hatchOverlay = Instance.new("Frame")
+hatchOverlay.Name = "HatchOverlay"
+hatchOverlay.BackgroundColor3 = Color3.fromRGB(4, 6, 10)
+hatchOverlay.BackgroundTransparency = 1
+hatchOverlay.BorderSizePixel = 0
+hatchOverlay.Size = UDim2.fromScale(1, 1)
+hatchOverlay.Visible = false
+hatchOverlay.Parent = gui
+
+local hatchCard = Instance.new("Frame")
+hatchCard.Name = "Card"
+hatchCard.AnchorPoint = Vector2.new(0.5, 0.5)
+hatchCard.Position = UDim2.fromScale(0.5, 0.5)
+hatchCard.Size = UDim2.fromOffset(470, 360)
+hatchCard.BackgroundColor3 = Color3.fromRGB(15, 18, 24)
+hatchCard.BackgroundTransparency = 0.08
+hatchCard.BorderSizePixel = 0
+hatchCard.Parent = hatchOverlay
+
+local hatchCardCorner = Instance.new("UICorner")
+hatchCardCorner.CornerRadius = UDim.new(0, 16)
+hatchCardCorner.Parent = hatchCard
+
+local hatchCardStroke = Instance.new("UIStroke")
+hatchCardStroke.Thickness = 1.8
+hatchCardStroke.Transparency = 0.2
+hatchCardStroke.Color = Color3.fromRGB(118, 138, 255)
+hatchCardStroke.Parent = hatchCard
+
+local hatchScale = Instance.new("UIScale")
+hatchScale.Scale = 1
+hatchScale.Parent = hatchCard
+
+local hatchTitle = Instance.new("TextLabel")
+hatchTitle.Name = "Title"
+hatchTitle.BackgroundTransparency = 1
+hatchTitle.Position = UDim2.fromOffset(18, 14)
+hatchTitle.Size = UDim2.new(1, -36, 0, 34)
+hatchTitle.Font = Enum.Font.GothamBold
+hatchTitle.TextColor3 = Color3.fromRGB(242, 242, 249)
+hatchTitle.TextSize = 24
+hatchTitle.Text = "Hatching..."
+hatchTitle.Parent = hatchCard
+
+local hatchEggImage = Instance.new("ImageLabel")
+hatchEggImage.Name = "EggImage"
+hatchEggImage.BackgroundTransparency = 1
+hatchEggImage.AnchorPoint = Vector2.new(0.5, 0.5)
+hatchEggImage.Position = UDim2.fromScale(0.5, 0.52)
+hatchEggImage.Size = UDim2.fromOffset(220, 220)
+hatchEggImage.Image = "rbxassetid://0"
+hatchEggImage.ScaleType = Enum.ScaleType.Fit
+hatchEggImage.Parent = hatchCard
+
+local hatchPetImage = Instance.new("ImageLabel")
+hatchPetImage.Name = "PetImage"
+hatchPetImage.BackgroundTransparency = 1
+hatchPetImage.AnchorPoint = Vector2.new(0.5, 0.5)
+hatchPetImage.Position = UDim2.fromScale(0.5, 0.52)
+hatchPetImage.Size = UDim2.fromOffset(230, 230)
+hatchPetImage.Image = "rbxassetid://0"
+hatchPetImage.ScaleType = Enum.ScaleType.Fit
+hatchPetImage.Visible = false
+hatchPetImage.Parent = hatchCard
+
+local petScale = Instance.new("UIScale")
+petScale.Scale = 0.5
+petScale.Parent = hatchPetImage
+
+local hatchInfo = Instance.new("TextLabel")
+hatchInfo.Name = "Info"
+hatchInfo.BackgroundTransparency = 1
+hatchInfo.AnchorPoint = Vector2.new(0.5, 1)
+hatchInfo.Position = UDim2.new(0.5, 0, 1, -12)
+hatchInfo.Size = UDim2.new(1, -28, 0, 68)
+hatchInfo.Font = Enum.Font.GothamBold
+hatchInfo.TextWrapped = true
+hatchInfo.TextSize = 22
+hatchInfo.TextColor3 = Color3.fromRGB(246, 246, 251)
+hatchInfo.Text = ""
+hatchInfo.Parent = hatchCard
+
+local flash = Instance.new("Frame")
+flash.Name = "Flash"
+flash.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+flash.BackgroundTransparency = 1
+flash.BorderSizePixel = 0
+flash.Size = UDim2.fromScale(1, 1)
+flash.Visible = false
+flash.ZIndex = 40
+flash.Parent = hatchOverlay
+
+local hatchDim = Instance.new("Frame")
+hatchDim.Name = "Dim"
+hatchDim.BackgroundColor3 = Color3.fromRGB(5, 8, 18)
+hatchDim.BackgroundTransparency = 1
+hatchDim.BorderSizePixel = 0
+hatchDim.Size = UDim2.fromScale(1, 1)
+hatchDim.Visible = false
+hatchDim.ZIndex = 20
+hatchDim.Parent = hatchOverlay
+
+local starRoot = Instance.new("Frame")
+starRoot.Name = "StarRoot"
+starRoot.AnchorPoint = Vector2.new(0.5, 0.5)
+starRoot.Position = UDim2.fromScale(0.5, 1.26)
+starRoot.Size = UDim2.fromOffset(300, 300)
+starRoot.BackgroundTransparency = 1
+starRoot.Visible = false
+starRoot.ZIndex = 24
+starRoot.Parent = hatchOverlay
+
+local starScale = Instance.new("UIScale")
+starScale.Name = "StarScale"
+starScale.Scale = 1
+starScale.Parent = starRoot
+
+local starDetailBack = Instance.new("ImageLabel")
+starDetailBack.Name = "StarDetailBack"
+starDetailBack.AnchorPoint = Vector2.new(0.5, 0.5)
+starDetailBack.Position = UDim2.fromScale(0.5, 0.5)
+starDetailBack.Size = UDim2.fromScale(1.55, 1.55)
+starDetailBack.BackgroundTransparency = 1
+starDetailBack.Image = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+starDetailBack.ScaleType = Enum.ScaleType.Fit
+starDetailBack.ImageTransparency = 1
+starDetailBack.ZIndex = 24
+starDetailBack.Parent = starRoot
+
+local starDetailFront = Instance.new("ImageLabel")
+starDetailFront.Name = "StarDetailFront"
+starDetailFront.AnchorPoint = Vector2.new(0.5, 0.5)
+starDetailFront.Position = UDim2.fromScale(0.5, 0.5)
+starDetailFront.Size = UDim2.fromScale(1.2, 1.2)
+starDetailFront.BackgroundTransparency = 1
+starDetailFront.Image = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+starDetailFront.ScaleType = Enum.ScaleType.Fit
+starDetailFront.ImageTransparency = 1
+starDetailFront.ZIndex = 25
+starDetailFront.Parent = starRoot
+
+local starMain = Instance.new("ImageLabel")
+starMain.Name = "StarMain"
+starMain.AnchorPoint = Vector2.new(0.5, 0.5)
+starMain.Position = UDim2.fromScale(0.5, 0.5)
+starMain.Size = UDim2.fromScale(1, 1)
+starMain.BackgroundTransparency = 1
+starMain.Image = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+starMain.ScaleType = Enum.ScaleType.Fit
+starMain.ImageTransparency = 1
+starMain.ZIndex = 26
+starMain.Parent = starRoot
+
+local revealEggImage = Instance.new("ImageLabel")
+revealEggImage.Name = "RevealEggImage"
+revealEggImage.BackgroundTransparency = 1
+revealEggImage.AnchorPoint = Vector2.new(0.5, 0.5)
+revealEggImage.Position = UDim2.fromScale(0.5, 0.53)
+revealEggImage.Size = UDim2.fromOffset(210, 210)
+revealEggImage.Image = "rbxassetid://0"
+revealEggImage.ScaleType = Enum.ScaleType.Fit
+revealEggImage.Visible = false
+revealEggImage.ZIndex = 23
+revealEggImage.Parent = hatchOverlay
+
+local revealPetImage = Instance.new("ImageLabel")
+revealPetImage.Name = "RevealPetImage"
+revealPetImage.BackgroundTransparency = 1
+revealPetImage.AnchorPoint = Vector2.new(0.5, 0.5)
+revealPetImage.Position = UDim2.fromScale(0.5, 0.54)
+revealPetImage.Size = UDim2.fromOffset(380, 380)
+revealPetImage.Image = "rbxassetid://0"
+revealPetImage.ScaleType = Enum.ScaleType.Fit
+revealPetImage.Visible = false
+revealPetImage.ZIndex = 27
+revealPetImage.Parent = hatchOverlay
+
+local revealPetScale = Instance.new("UIScale")
+revealPetScale.Scale = 0.8
+revealPetScale.Parent = revealPetImage
+
+local revealName = Instance.new("TextLabel")
+revealName.Name = "RevealName"
+revealName.AnchorPoint = Vector2.new(0.5, 0.5)
+revealName.Position = UDim2.fromScale(0.5, 0.79)
+revealName.Size = UDim2.new(0.7, 0, 0, 48)
+revealName.BackgroundTransparency = 1
+revealName.TextColor3 = Color3.fromRGB(255, 255, 255)
+revealName.TextStrokeColor3 = Color3.fromRGB(12, 12, 12)
+revealName.TextStrokeTransparency = 0.2
+revealName.TextTransparency = 1
+revealName.Font = Enum.Font.GothamBlack
+revealName.TextSize = 42
+revealName.TextWrapped = true
+revealName.Text = ""
+revealName.Visible = false
+revealName.ZIndex = 28
+revealName.Parent = hatchOverlay
+
+local revealRarity = Instance.new("TextLabel")
+revealRarity.Name = "RevealRarity"
+revealRarity.AnchorPoint = Vector2.new(0.5, 0.5)
+revealRarity.Position = UDim2.fromScale(0.5, 0.845)
+revealRarity.Size = UDim2.new(0.6, 0, 0, 30)
+revealRarity.BackgroundTransparency = 1
+revealRarity.TextColor3 = Color3.fromRGB(255, 220, 130)
+revealRarity.TextStrokeColor3 = Color3.fromRGB(10, 10, 10)
+revealRarity.TextStrokeTransparency = 0.25
+revealRarity.TextTransparency = 1
+revealRarity.Font = Enum.Font.GothamBold
+revealRarity.TextSize = 24
+revealRarity.Text = ""
+revealRarity.Visible = false
+revealRarity.ZIndex = 28
+revealRarity.Parent = hatchOverlay
+
+local toast = Instance.new("TextLabel")
+toast.Name = "Toast"
+toast.AnchorPoint = Vector2.new(0.5, 1)
+toast.Position = UDim2.new(0.5, 0, 1, -24)
+toast.Size = UDim2.fromOffset(860, 52)
+toast.BackgroundColor3 = Color3.fromRGB(16, 19, 26)
+toast.BackgroundTransparency = 1
+toast.BorderSizePixel = 0
+toast.Font = Enum.Font.FredokaOne
+toast.TextSize = 28
+toast.TextColor3 = Color3.fromRGB(240, 240, 246)
+toast.TextStrokeColor3 = Color3.fromRGB(10, 10, 10)
+toast.TextStrokeTransparency = 0.2
+toast.TextWrapped = true
+toast.Text = ""
+toast.TextTransparency = 1
+toast.Visible = false
+toast.Parent = gui
+
+local toastVersion = 0
+
+local function resetHatchVisualState()
+	flash.Visible = false
+	hatchDim.Visible = false
+	starRoot.Visible = false
+	revealEggImage.Visible = false
+	revealPetImage.Visible = false
+	revealName.Visible = false
+	revealRarity.Visible = false
+	hatchCard.Visible = true
+	hatchOverlay.Visible = false
+end
+
+local function tween(obj: Instance, info: TweenInfo, goal: {[string]: any}): Tween
+	local t = TweenService:Create(obj, info, goal)
+	t:Play()
+	return t
+end
+
+local function showToast(ok: boolean, message: string)
+	local msg = tostring(message or "")
+	if msg == "" then
+		return
+	end
+	toastVersion += 1
+	local version = toastVersion
+
+	toast.Text = msg
+	toast.TextColor3 = ok and Color3.fromRGB(120, 255, 155) or Color3.fromRGB(255, 110, 110)
+	toast.BackgroundTransparency = 1
+	toast.TextTransparency = 1
+	toast.Visible = true
+
+	tween(toast, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		TextTransparency = 0,
+	})
+	task.delay(UI.ToastDuration, function()
+		if version ~= toastVersion then
+			return
+		end
+		local out = tween(toast, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			TextTransparency = 1,
+		})
+		out.Completed:Wait()
+		if version ~= toastVersion then
+			return
+		end
+		toast.Visible = false
+	end)
+end
+
+local function fmtChance(n: number): string
+	if n >= 10 then
+		return string.format("%.1f%%", n)
+	end
+	if n >= 1 then
+		return string.format("%.2f%%", n)
+	end
+	return string.format("%.3f%%", n)
+end
+
+local function normalizeImageId(raw: any): string
+	if raw == nil then
+		return "rbxasset://textures/ui/GuiImagePlaceholder.png"
+	end
+	local s = tostring(raw):gsub("%s+", "")
+	if s == "" then
+		return "rbxasset://textures/ui/GuiImagePlaceholder.png"
+	end
+	if string.sub(s, 1, #"rbxassetid://") == "rbxassetid://" then
+		return s
+	end
+	if string.sub(s, 1, #"rbxasset://") == "rbxasset://" then
+		return s
+	end
+	local n = tonumber(s)
+	if n then
+		return ("rbxassetid://%d"):format(n)
+	end
+	return EggCatalog.NormalizeAssetId(raw)
+end
+
+local function findFirstTextLabelByNames(root: Instance, names: {string}): TextLabel?
+	for _, name in ipairs(names) do
+		local found = root:FindFirstChild(name, true)
+		if found and found:IsA("TextLabel") then
+			return found
+		end
+	end
+	return nil
+end
+
+local function setGuiObjectImage(target: GuiObject, image: string, transparency: number)
+	if target:IsA("ImageLabel") or target:IsA("ImageButton") then
+		target.Image = image
+		target.ImageTransparency = transparency
+	end
+end
+
+local function setGuiObjectText(target: GuiObject, text: string)
+	if target:IsA("TextLabel") or target:IsA("TextButton") or target:IsA("TextBox") then
+		target.Text = text
+	end
+end
+
+local function getPreviewStyleSettingNumber(key: string, fallback: number): number
+	local settings = EggCatalog.Settings or {}
+	return tonumber(settings[key]) or fallback
+end
+
+local function getPreviewStyleSettingBool(key: string, fallback: boolean): boolean
+	local settings = EggCatalog.Settings or {}
+	local raw = settings[key]
+	if typeof(raw) == "boolean" then
+		return raw
+	end
+	return fallback
+end
+
+local function isPetRaritySlotRoot(slotRoot: GuiObject): boolean
+	if string.match(slotRoot.Name, "^PetRarity%d+$") then
+		return true
+	end
+	return slotRoot:GetAttribute("EggPetRaritySlot") == true
+end
+
+local function getSlotIconScale(slotRoot: GuiObject): number
+	local base = getPreviewStyleSettingNumber("PreviewSlotIconScale", 0.9)
+	if isPetRaritySlotRoot(slotRoot) then
+		base = getPreviewStyleSettingNumber("PreviewPetRarityIconScale", base)
+	end
+	return math.clamp(base, 0.2, 1.4)
+end
+
+local function getSlotIconOffsetY(slotRoot: GuiObject): number
+	if isPetRaritySlotRoot(slotRoot) then
+		return getPreviewStyleSettingNumber("PreviewPetRarityIconOffsetY", 0)
+	end
+	return getPreviewStyleSettingNumber("PreviewSlotIconOffsetY", -0.03)
+end
+
+local function shouldReserveChanceSpace(slotRoot: GuiObject): boolean
+	if isPetRaritySlotRoot(slotRoot) then
+		return getPreviewStyleSettingBool("PreviewPetRarityReserveChanceSpace", false)
+	end
+	return true
+end
+
+local function getPetRarityChanceGap(): number
+	return getPreviewStyleSettingNumber("PreviewPetRarityChanceGap", 0)
+end
+
+local function shouldUseImageSlotAsContainer(slotRoot: GuiObject): boolean
+	local settings = EggCatalog.Settings or {}
+	if settings.PreviewImageSlotAsContainer == false then
+		return false
+	end
+	local explicit = slotRoot:GetAttribute("EggSlotImageAsContainer")
+	if typeof(explicit) == "boolean" then
+		return explicit
+	end
+	if isPetRaritySlotRoot(slotRoot) then
+		return true
+	end
+	if slotRoot:FindFirstChild("Chance", true) or slotRoot:FindFirstChild("Percent", true) then
+		return true
+	end
+	return false
+end
+
+local function ensureSlotOverlayIcon(slotRoot: GuiObject): GuiObject
+	local existing = slotRoot:FindFirstChild("Icon", true)
+	if existing and (existing:IsA("ImageLabel") or existing:IsA("ImageButton")) then
+		return existing :: GuiObject
+	end
+	local overlay = Instance.new("ImageLabel")
+	overlay.Name = "Icon"
+	overlay.BackgroundTransparency = 1
+	overlay.AnchorPoint = Vector2.new(0.5, 0.5)
+	overlay.Position = UDim2.fromScale(0.5, 0.5 + getSlotIconOffsetY(slotRoot))
+	local iconScale = getSlotIconScale(slotRoot)
+	overlay.Size = UDim2.fromScale(iconScale, iconScale)
+	overlay.Image = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+	overlay.ScaleType = Enum.ScaleType.Fit
+	overlay.ZIndex = slotRoot.ZIndex + 1
+	overlay.Parent = slotRoot
+	return overlay
+end
+
+local function getConfiguredBillboardSize(): (number, number)
+	local settings = EggCatalog.Settings or {}
+	local width = math.max(120, math.floor(tonumber(settings.PreviewBillboardWidth) or 220))
+	local height = math.max(70, math.floor(tonumber(settings.PreviewBillboardHeight) or 84))
+	return width, height
+end
+
+local function normalizeTemplateRootLayout(billboard: BillboardGui): GuiObject?
+	local rootAny = billboard:FindFirstChild("Root")
+	if not rootAny then
+		rootAny = billboard:FindFirstChild("Frame")
+	end
+	if rootAny and rootAny:IsA("GuiObject") then
+		rootAny.AnchorPoint = Vector2.new(0, 0)
+		rootAny.Position = UDim2.fromScale(0, 0)
+		rootAny.Size = UDim2.fromScale(1, 1)
+		rootAny.ClipsDescendants = false
+		return rootAny
+	end
+	return nil
+end
+
+local function ensureNamedUiScale(guiObj: GuiObject, name: string): UIScale
+	local existing = guiObj:FindFirstChild(name)
+	if existing and existing:IsA("UIScale") then
+		return existing
+	end
+	if existing then
+		existing:Destroy()
+	end
+	local scale = Instance.new("UIScale")
+	scale.Name = name
+	scale.Scale = 1
+	scale.Parent = guiObj
+	return scale
+end
+
+local function applyTemplateAutoScale(
+	root: GuiObject?,
+	baseWidth: number,
+	baseHeight: number,
+	targetWidth: number,
+	targetHeight: number,
+	keepTemplateSize: boolean
+)
+	if not root then
+		return
+	end
+	local autoScale = ensureNamedUiScale(root, "EggTemplateAutoScale")
+	if keepTemplateSize then
+		autoScale.Scale = 1
+		return
+	end
+	local sx = (baseWidth > 0) and (targetWidth / baseWidth) or 1
+	local sy = (baseHeight > 0) and (targetHeight / baseHeight) or 1
+	autoScale.Scale = math.clamp(math.min(sx, sy), 0.2, 4)
+end
+
+local function normalizeTemplateSlotVisuals(slots: {PreviewSlotBinding})
+	local chanceHeightCfg = math.clamp(math.floor(getPreviewStyleSettingNumber("PreviewSlotChanceHeight", 14)), 0, 40)
+	local petChanceGap = getPetRarityChanceGap()
+
+	for _, slot in ipairs(slots) do
+		local reserveChanceSpace = shouldReserveChanceSpace(slot.Root)
+		local iconScaleCfg = getSlotIconScale(slot.Root)
+		local iconOffsetYCfg = getSlotIconOffsetY(slot.Root)
+
+		slot.Root.ClipsDescendants = reserveChanceSpace
+		if slot.Root:IsA("ImageLabel") or slot.Root:IsA("ImageButton") then
+			slot.Root.ScaleType = Enum.ScaleType.Fit
+		end
+
+		if slot.Root ~= slot.Icon and slot.Icon.Parent == slot.Root then
+			local chanceHeight = 0
+			if slot.ChanceLabel and slot.ChanceLabel.Parent == slot.Root then
+				chanceHeight = chanceHeightCfg
+				if reserveChanceSpace then
+					slot.ChanceLabel.AnchorPoint = Vector2.new(0.5, 1)
+					slot.ChanceLabel.Position = UDim2.new(0.5, 0, 1, 0)
+				else
+					slot.ChanceLabel.AnchorPoint = Vector2.new(0.5, 0)
+					slot.ChanceLabel.Position = UDim2.new(0.5, 0, 1, petChanceGap)
+				end
+				slot.ChanceLabel.Size = UDim2.new(1, 0, 0, chanceHeight)
+				slot.ChanceLabel.ZIndex = math.max(slot.ChanceLabel.ZIndex, slot.Root.ZIndex + 1)
+			end
+
+			slot.Icon.AnchorPoint = Vector2.new(0.5, 0.5)
+			local chanceShift = 0
+			if reserveChanceSpace and chanceHeight > 0 then
+				chanceShift = chanceHeight / math.max(1, slot.Root.AbsoluteSize.Y) * 0.45
+			end
+			slot.Icon.Position = UDim2.fromScale(0.5, 0.5 - chanceShift + iconOffsetYCfg)
+			slot.Icon.Size = UDim2.fromScale(iconScaleCfg, iconScaleCfg)
+		elseif slot.ChanceLabel then
+			if reserveChanceSpace then
+				slot.ChanceLabel.AnchorPoint = Vector2.new(0.5, 1)
+				slot.ChanceLabel.Position = UDim2.new(0.5, 0, 1, 0)
+			else
+				slot.ChanceLabel.AnchorPoint = Vector2.new(0.5, 0)
+				slot.ChanceLabel.Position = UDim2.new(0.5, 0, 1, petChanceGap)
+			end
+			slot.ChanceLabel.Size = UDim2.new(1, 0, 0, chanceHeightCfg)
+			slot.ChanceLabel.ZIndex = math.max(slot.ChanceLabel.ZIndex, slot.Root.ZIndex + 1)
+		end
+	end
+end
+
+local function normalizeEggToolTipContainer(eggToolTip: GuiObject?)
+	if not eggToolTip then
+		return
+	end
+	eggToolTip.AnchorPoint = Vector2.new(0, 0)
+	eggToolTip.Position = UDim2.fromScale(0, 0)
+	eggToolTip.Size = UDim2.fromScale(1, 1)
+	eggToolTip.BackgroundTransparency = 1
+	eggToolTip.ClipsDescendants = false
+end
+
+local function removeSizingConstraints(root: Instance)
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("UISizeConstraint") or d:IsA("UIAspectRatioConstraint") or d:IsA("UIScale") then
+			d:Destroy()
+		end
+	end
+end
+
+local function normalizeAutoSize(guiObj: GuiObject)
+	guiObj.AutomaticSize = Enum.AutomaticSize.None
+end
+
+local function normalizeToolTipLayouts(container: GuiObject)
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("UIGridLayout") or child:IsA("UIPageLayout") or child:IsA("UIListLayout") then
+			child:Destroy()
+		end
+	end
+end
+
+local function compactTemplateSlots(
+	eggToolTip: GuiObject?,
+	slots: {PreviewSlotBinding},
+	billboardWidth: number,
+	billboardHeight: number
+)
+	if #slots <= 0 then
+		return
+	end
+
+	local slotCount = #slots
+	local paddingPx = math.max(0, math.floor(getPreviewStyleSettingNumber("PreviewSlotPadding", math.clamp(math.floor(billboardWidth * 0.014), 2, 8))))
+	local usableWidth = math.max(92, billboardWidth - 14)
+	local slotWidth = math.floor((usableWidth - ((slotCount - 1) * paddingPx)) / slotCount)
+	local slotMinWidth = math.max(24, math.floor(getPreviewStyleSettingNumber("PreviewSlotMinWidth", 64)))
+	local slotMaxWidth = math.max(slotMinWidth, math.floor(getPreviewStyleSettingNumber("PreviewSlotMaxWidth", 120)))
+	slotWidth = math.clamp(slotWidth, slotMinWidth, slotMaxWidth)
+	local slotHeightScale = math.clamp(getPreviewStyleSettingNumber("PreviewSlotHeightScale", 1.18), 0.7, 2.0)
+	local slotHeight = math.max(20, math.floor(slotWidth * slotHeightScale))
+	local chanceHeightCfg = math.clamp(math.floor(getPreviewStyleSettingNumber("PreviewSlotChanceHeight", 14)), 0, 40)
+	local petChanceGap = getPetRarityChanceGap()
+
+	if eggToolTip then
+		normalizeToolTipLayouts(eggToolTip)
+		eggToolTip.AnchorPoint = Vector2.new(0, 0)
+		eggToolTip.Position = UDim2.fromScale(0, 0)
+		eggToolTip.Size = UDim2.new(1, -4, 1, -2)
+		eggToolTip.BackgroundTransparency = 1
+		eggToolTip.ClipsDescendants = true
+	end
+
+	local totalWidth = slotCount * slotWidth + ((slotCount - 1) * paddingPx)
+	local startXOffset = getPreviewStyleSettingNumber("PreviewSlotStartXOffset", 0)
+	local startYOffset = getPreviewStyleSettingNumber("PreviewSlotStartYOffset", 0)
+	local startX = math.max(0, math.floor((billboardWidth - totalWidth) * 0.5 + startXOffset))
+	local startY = math.max(0, math.floor((billboardHeight - slotHeight) * 0.5 + startYOffset))
+
+	for i, slot in ipairs(slots) do
+		removeSizingConstraints(slot.Root)
+		removeSizingConstraints(slot.Icon)
+		normalizeAutoSize(slot.Root)
+		normalizeAutoSize(slot.Icon)
+		local reserveChanceSpace = shouldReserveChanceSpace(slot.Root)
+		local iconScaleCfg = getSlotIconScale(slot.Root)
+		local iconOffsetYCfg = getSlotIconOffsetY(slot.Root)
+		slot.Root.LayoutOrder = i
+		slot.Root.ClipsDescendants = reserveChanceSpace
+		if eggToolTip and slot.Root.Parent == eggToolTip then
+			slot.Root.AnchorPoint = Vector2.new(0, 0)
+			slot.Root.Position = UDim2.fromOffset(startX + ((i - 1) * (slotWidth + paddingPx)), startY)
+		end
+		slot.Root.Size = UDim2.fromOffset(slotWidth, slotHeight)
+
+		if slot.Root:IsA("ImageLabel") or slot.Root:IsA("ImageButton") then
+			slot.Root.ScaleType = Enum.ScaleType.Fit
+		end
+		if slot.Icon ~= slot.Root then
+			slot.Icon.AnchorPoint = Vector2.new(0.5, 0.5)
+			local chanceShift = 0
+			if reserveChanceSpace and chanceHeightCfg > 0 then
+				chanceShift = (chanceHeightCfg / math.max(1, slotHeight)) * 0.45
+			end
+			slot.Icon.Position = UDim2.fromScale(0.5, 0.5 - chanceShift + iconOffsetYCfg)
+			slot.Icon.Size = UDim2.fromScale(iconScaleCfg, iconScaleCfg)
+		end
+		if slot.Icon:IsA("ImageLabel") or slot.Icon:IsA("ImageButton") then
+			slot.Icon.ScaleType = Enum.ScaleType.Fit
+		end
+
+		if slot.ChanceLabel then
+			normalizeAutoSize(slot.ChanceLabel)
+			if reserveChanceSpace then
+				slot.ChanceLabel.AnchorPoint = Vector2.new(0.5, 1)
+				slot.ChanceLabel.Position = UDim2.new(0.5, 0, 1, 0)
+			else
+				slot.ChanceLabel.AnchorPoint = Vector2.new(0.5, 0)
+				slot.ChanceLabel.Position = UDim2.new(0.5, 0, 1, petChanceGap)
+			end
+			slot.ChanceLabel.Size = UDim2.new(1, 0, 0, chanceHeightCfg)
+			if slot.ChanceLabel:IsA("TextLabel") or slot.ChanceLabel:IsA("TextButton") or slot.ChanceLabel:IsA("TextBox") then
+				slot.ChanceLabel.TextScaled = false
+				slot.ChanceLabel.TextSize = math.clamp(math.floor(slotWidth * 0.3), 10, 13)
+			end
+		end
+	end
+end
+
+local function getSlotSortIndex(slotRoot: GuiObject, fallbackIndex: number): number
+	local attr = slotRoot:GetAttribute("EggSlotIndex")
+	if typeof(attr) == "number" then
+		return math.max(1, math.floor(attr))
+	end
+	local suffix = string.match(slotRoot.Name, "(%d+)$")
+	if suffix then
+		local n = tonumber(suffix)
+		if n then
+			return math.max(1, math.floor(n))
+		end
+	end
+	return fallbackIndex
+end
+
+local function buildSlotBinding(slotRoot: GuiObject, fallbackIndex: number): PreviewSlotBinding?
+	local icon: GuiObject? = nil
+	if slotRoot:IsA("ImageLabel") or slotRoot:IsA("ImageButton") then
+		if shouldUseImageSlotAsContainer(slotRoot) then
+			icon = ensureSlotOverlayIcon(slotRoot)
+		else
+			icon = slotRoot
+		end
+	else
+		local iconNamed = slotRoot:FindFirstChild("Icon", true)
+		if iconNamed and (iconNamed:IsA("ImageLabel") or iconNamed:IsA("ImageButton")) then
+			icon = iconNamed :: GuiObject
+		else
+			for _, d in ipairs(slotRoot:GetDescendants()) do
+				if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+					icon = d :: GuiObject
+					break
+				end
+			end
+		end
+	end
+	if not icon then
+		-- Fallback automatico para templates onde o slot e somente Frame.
+		local autoIcon = Instance.new("ImageLabel")
+		autoIcon.Name = "AutoIcon"
+		autoIcon.AnchorPoint = Vector2.new(0.5, 0.5)
+		autoIcon.Position = UDim2.fromScale(0.5, 0.5)
+		autoIcon.Size = UDim2.fromScale(0.84, 0.84)
+		autoIcon.BackgroundTransparency = 1
+		autoIcon.Image = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+		autoIcon.ScaleType = Enum.ScaleType.Fit
+		autoIcon.Parent = slotRoot
+		icon = autoIcon
+	end
+
+	local chanceAny = slotRoot:FindFirstChild("Chance", true)
+	if not chanceAny then
+		chanceAny = slotRoot:FindFirstChild("Percent", true)
+	end
+
+	local chanceLabel: GuiObject? = nil
+	if chanceAny and (chanceAny:IsA("TextLabel") or chanceAny:IsA("TextButton") or chanceAny:IsA("TextBox")) then
+		chanceLabel = chanceAny
+	end
+
+	return {
+		SortIndex = getSlotSortIndex(slotRoot, fallbackIndex),
+		Root = slotRoot,
+		Icon = icon,
+		ChanceLabel = chanceLabel,
+	}
+end
+
+local function getTemplateSource(): Instance?
+	local settings = EggCatalog.Settings or {}
+	local configured = tostring(settings.PreviewTemplateName or "EggPreviewTemplate")
+	local names = {
+		configured,
+		"EggPreviewTemplate",
+		"EggPreviewBillboardTemplate",
+		"EggPreviewGuiTemplate",
+	}
+	for _, name in ipairs(names) do
+		local found = ReplicatedStorage:FindFirstChild(name, true)
+		if found then
+			return found
+		end
+	end
+	return nil
+end
+
+local function createDefaultBillboardBinding(): PromptPreviewBinding
+	local settings = EggCatalog.Settings or {}
+	local offsetY = tonumber(settings.PreviewBillboardOffsetY) or 3.7
+	local width, height = getConfiguredBillboardSize()
+	local slotCount = math.max(3, math.min(8, math.floor(tonumber(settings.PreviewSlotsFallback) or 5)))
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "EggPreviewBillboard"
+	billboard.Size = UDim2.fromOffset(width, height)
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.MaxDistance = 80
+	billboard.StudsOffsetWorldSpace = Vector3.new(0, offsetY, 0)
+	billboard.Enabled = false
+	billboard.Parent = gui
+
+	local root = Instance.new("Frame")
+	root.Name = "Root"
+	root.Size = UDim2.fromScale(1, 1)
+	root.BackgroundColor3 = Color3.fromRGB(18, 22, 28)
+	root.BackgroundTransparency = 0.2
+	root.BorderSizePixel = 0
+	root.Parent = billboard
+
+	local rootCorner = Instance.new("UICorner")
+	rootCorner.CornerRadius = UDim.new(0, 16)
+	rootCorner.Parent = root
+
+	local rootStroke = Instance.new("UIStroke")
+	rootStroke.Thickness = 1.4
+	rootStroke.Transparency = 0.2
+	rootStroke.Color = Color3.fromRGB(97, 120, 255)
+	rootStroke.Parent = root
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.BackgroundTransparency = 1
+	title.Position = UDim2.fromOffset(14, 8)
+	title.Size = UDim2.new(1, -28, 0, 26)
+	title.Font = Enum.Font.GothamBold
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextSize = 20
+	title.TextColor3 = Color3.fromRGB(245, 245, 249)
+	title.Text = "Egg"
+	title.Parent = root
+
+	local price = Instance.new("TextLabel")
+	price.Name = "Price"
+	price.BackgroundTransparency = 1
+	price.Position = UDim2.fromOffset(10, 28)
+	price.Size = UDim2.new(1, -28, 0, 20)
+	price.Font = Enum.Font.GothamSemibold
+	price.TextXAlignment = Enum.TextXAlignment.Left
+	price.TextSize = 13
+	price.TextColor3 = Color3.fromRGB(200, 218, 242)
+	price.Text = "Cost: 0 Coins"
+	price.Parent = root
+
+	local slotsContainer = Instance.new("Frame")
+	slotsContainer.Name = "Slots"
+	slotsContainer.BackgroundTransparency = 1
+	slotsContainer.Position = UDim2.fromOffset(8, 46)
+	slotsContainer.Size = UDim2.new(1, -16, 1, -52)
+	slotsContainer.Parent = root
+
+	local list = Instance.new("UIListLayout")
+	list.FillDirection = Enum.FillDirection.Horizontal
+	list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	list.VerticalAlignment = Enum.VerticalAlignment.Center
+	list.Padding = UDim.new(0, 6)
+	list.SortOrder = Enum.SortOrder.LayoutOrder
+	list.Parent = slotsContainer
+
+	local slots: {PreviewSlotBinding} = {}
+	local slotWidth = math.clamp(math.floor((width - 24 - ((slotCount - 1) * 6)) / slotCount), 48, 82)
+	local slotHeight = math.clamp(slotWidth + 12, 60, 98)
+	local iconDiameter = math.clamp(slotWidth - 6, 40, 76)
+
+	for i = 1, slotCount do
+		local slot = Instance.new("Frame")
+		slot.Name = ("Slot%d"):format(i)
+		slot.LayoutOrder = i
+		slot.Size = UDim2.fromOffset(slotWidth, slotHeight)
+		slot.BackgroundTransparency = 1
+		slot:SetAttribute("EggSlotIndex", i)
+		slot.Parent = slotsContainer
+
+		local iconBack = Instance.new("Frame")
+		iconBack.Name = "IconBack"
+		iconBack.AnchorPoint = Vector2.new(0.5, 0)
+		iconBack.Position = UDim2.fromScale(0.5, 0)
+		iconBack.Size = UDim2.fromOffset(iconDiameter, iconDiameter)
+		iconBack.BackgroundColor3 = Color3.fromRGB(164, 164, 164)
+		iconBack.BackgroundTransparency = 0.06
+		iconBack.BorderSizePixel = 0
+		iconBack.Parent = slot
+
+		local backCorner = Instance.new("UICorner")
+		backCorner.CornerRadius = UDim.new(1, 0)
+		backCorner.Parent = iconBack
+
+		local backStroke = Instance.new("UIStroke")
+		backStroke.Thickness = 1
+		backStroke.Transparency = 0.35
+		backStroke.Color = Color3.fromRGB(230, 230, 230)
+		backStroke.Parent = iconBack
+
+		local icon = Instance.new("ImageLabel")
+		icon.Name = "Icon"
+		icon.AnchorPoint = Vector2.new(0.5, 0.5)
+		icon.Position = UDim2.fromScale(0.5, 0.5)
+		icon.Size = UDim2.fromScale(0.84, 0.84)
+		icon.BackgroundTransparency = 1
+		icon.Image = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+		icon.ScaleType = Enum.ScaleType.Fit
+		icon.Parent = iconBack
+
+		local chance = Instance.new("TextLabel")
+		chance.Name = "Chance"
+		chance.BackgroundTransparency = 1
+		chance.AnchorPoint = Vector2.new(0.5, 1)
+		chance.Position = UDim2.new(0.5, 0, 1, 0)
+		chance.Size = UDim2.new(1, 0, 0, 14)
+		chance.Font = Enum.Font.GothamSemibold
+		chance.TextSize = 11
+		chance.TextColor3 = Color3.fromRGB(245, 245, 245)
+		chance.TextStrokeTransparency = 0.45
+		chance.Text = "--"
+		chance.Parent = slot
+
+		table.insert(slots, {
+			SortIndex = i,
+			Root = slot,
+			Icon = icon,
+			ChanceLabel = chance,
+		})
+	end
+
+	return {
+		Gui = billboard,
+		TitleLabel = title,
+		PriceLabel = price,
+		Slots = slots,
+	}
+end
+
+local function createTemplateBillboardBinding(source: Instance): PromptPreviewBinding?
+	local settings = EggCatalog.Settings or {}
+	local offsetY = tonumber(settings.PreviewBillboardOffsetY) or 3.7
+	local keepTemplateSize = settings.PreviewKeepTemplateSize == true
+	local forceCompactSlots = settings.PreviewForceCompactSlots == true
+	local width, height = getConfiguredBillboardSize()
+	local baseWidth = width
+	local baseHeight = height
+
+	local billboard: BillboardGui? = nil
+	if source:IsA("BillboardGui") then
+		local sx = source.Size.X.Offset
+		local sy = source.Size.Y.Offset
+		baseWidth = math.max(1, math.floor(sx > 0 and sx or width))
+		baseHeight = math.max(1, math.floor(sy > 0 and sy or height))
+		billboard = source:Clone()
+		if not keepTemplateSize then
+			billboard.Size = UDim2.fromOffset(width, height)
+		end
+	elseif source:IsA("GuiObject") then
+		local wrapper = Instance.new("BillboardGui")
+		wrapper.Name = "EggPreviewBillboard"
+		local sx = source.Size.X.Offset
+		local sy = source.Size.Y.Offset
+		baseWidth = math.max(1, math.floor(sx > 0 and sx or width))
+		baseHeight = math.max(1, math.floor(sy > 0 and sy or height))
+		if keepTemplateSize then
+			if sx <= 0 then
+				sx = width
+			end
+			if sy <= 0 then
+				sy = height
+			end
+			wrapper.Size = UDim2.fromOffset(sx, sy)
+		else
+			wrapper.Size = UDim2.fromOffset(width, height)
+		end
+		wrapper.AlwaysOnTop = true
+		wrapper.LightInfluence = 0
+		wrapper.MaxDistance = 80
+		wrapper.StudsOffsetWorldSpace = Vector3.new(0, offsetY, 0)
+		local root = source:Clone()
+		root.Name = "Root"
+		root.AnchorPoint = Vector2.new(0, 0)
+		root.Position = UDim2.fromScale(0, 0)
+		if root.Size.X.Scale == 0 and root.Size.X.Offset == 0 and root.Size.Y.Scale == 0 and root.Size.Y.Offset == 0 then
+			root.Size = UDim2.fromScale(1, 1)
+		end
+		root.Parent = wrapper
+		billboard = wrapper
+	end
+	if not billboard then
+		return nil
+	end
+
+	billboard.Enabled = false
+	billboard.Parent = gui
+	local root = normalizeTemplateRootLayout(billboard)
+
+	local title = findFirstTextLabelByNames(billboard, {"Title", "EggName", "Name"})
+	local price = findFirstTextLabelByNames(billboard, {"Price", "Cost", "Value"})
+
+	local slotCandidates: {GuiObject} = {}
+	local detectedPetRaritySlots = false
+	local eggToolTipAny = billboard:FindFirstChild("EggToolTip", true)
+	local eggToolTip: GuiObject? = nil
+	if eggToolTipAny and eggToolTipAny:IsA("GuiObject") then
+		eggToolTip = eggToolTipAny
+		if not forceCompactSlots then
+			normalizeEggToolTipContainer(eggToolTipAny)
+		end
+		for _, child in ipairs(eggToolTipAny:GetChildren()) do
+			if child:IsA("GuiObject") and string.match(child.Name, "^PetRarity%d+$") then
+				table.insert(slotCandidates, child)
+			end
+		end
+		detectedPetRaritySlots = #slotCandidates > 0
+	end
+
+	for _, d in ipairs(billboard:GetDescendants()) do
+		if #slotCandidates > 0 then
+			break
+		end
+		if d:IsA("GuiObject") and d:GetAttribute("EggIconSlot") == true then
+			table.insert(slotCandidates, d)
+		end
+	end
+	if #slotCandidates == 0 then
+		for _, d in ipairs(billboard:GetDescendants()) do
+			if d:IsA("GuiObject") and (string.match(d.Name, "^Slot%d+$") or string.match(d.Name, "^PetRarity%d+$")) then
+				table.insert(slotCandidates, d)
+			end
+		end
+	end
+	if #slotCandidates == 0 then
+		local containerNames = {"Slots", "PetSlots", "Icons", "PetIcons"}
+		for _, containerName in ipairs(containerNames) do
+			local container = billboard:FindFirstChild(containerName, true)
+			if container and container:IsA("GuiObject") then
+				for _, child in ipairs(container:GetChildren()) do
+					if child:IsA("GuiObject") then
+						local hasImage = child:IsA("ImageLabel") or (child:FindFirstChildWhichIsA("ImageLabel", true) ~= nil)
+						if hasImage then
+							table.insert(slotCandidates, child)
+						end
+					end
+				end
+			end
+			if #slotCandidates > 0 then
+				break
+			end
+		end
+	end
+	if #slotCandidates == 0 then
+		for _, d in ipairs(billboard:GetDescendants()) do
+			if d:IsA("ImageLabel") then
+				table.insert(slotCandidates, d)
+			end
+		end
+	end
+
+	local slots: {PreviewSlotBinding} = {}
+	for i, slotRoot in ipairs(slotCandidates) do
+		local slotBinding = buildSlotBinding(slotRoot, i)
+		if slotBinding then
+			table.insert(slots, slotBinding)
+		end
+	end
+
+	table.sort(slots, function(a, b)
+		return a.SortIndex < b.SortIndex
+	end)
+	local useCompactSlots = forceCompactSlots or detectedPetRaritySlots
+	applyTemplateAutoScale(root, baseWidth, baseHeight, width, height, keepTemplateSize or useCompactSlots)
+	normalizeTemplateSlotVisuals(slots)
+	if useCompactSlots then
+		compactTemplateSlots(eggToolTip, slots, width, height)
+	end
+
+	return {
+		Gui = billboard,
+		TitleLabel = title,
+		PriceLabel = price,
+		Slots = slots,
+	}
+end
+
+local function ensurePreviewBinding(prompt: ProximityPrompt): PromptPreviewBinding
+	local settings = EggCatalog.Settings or {}
+	local minDistance = math.max(1, tonumber(settings.PreviewBillboardMinDistance) or 40)
+	local distanceMul = math.max(0.1, tonumber(settings.PreviewBillboardDistanceMultiplier) or 2.5)
+	local offsetY = tonumber(settings.PreviewBillboardOffsetY) or 3.7
+
+	local existing = previewByPrompt[prompt]
+	if existing then
+		return existing
+	end
+
+	local source = getTemplateSource()
+	local binding: PromptPreviewBinding? = nil
+	if source then
+		binding = createTemplateBillboardBinding(source)
+	end
+	if not binding then
+		binding = createDefaultBillboardBinding()
+	end
+
+	local adornee = prompt.Parent
+	if adornee and adornee:IsA("Attachment") then
+		adornee = adornee.Parent
+	end
+	local promptAdornee: BasePart? = nil
+	if adornee and adornee:IsA("BasePart") then
+		promptAdornee = adornee
+	end
+	binding.Gui.Adornee = promptAdornee
+	binding.Gui.MaxDistance = math.max(minDistance, prompt.MaxActivationDistance * distanceMul)
+	binding.Gui.AlwaysOnTop = true
+	binding.Gui.LightInfluence = 0
+	if binding.Gui.StudsOffsetWorldSpace.Magnitude <= 0.001 then
+		binding.Gui.StudsOffsetWorldSpace = Vector3.new(0, offsetY, 0)
+	end
+	binding.Gui.Enabled = false
+
+	previewByPrompt[prompt] = binding
+	return binding
+end
+
+local function getPreviewPetIconId(row: {[string]: any}, eggFallbackImageId: any): string
+	local petName = tostring(row.PetName or "")
+	if petName ~= "" then
+		local petDef = select(1, PetCatalog.GetPetDefinition(petName))
+		if petDef and petDef.IconId then
+			return normalizeImageId(petDef.IconId)
+		end
+	end
+	return normalizeImageId(eggFallbackImageId)
+end
+
+local function updatePreviewFromPrompt(prompt: ProximityPrompt)
+	local eggIdAny = prompt:GetAttribute("EggId")
+	if typeof(eggIdAny) ~= "string" or eggIdAny == "" then
+		local binding = previewByPrompt[prompt]
+		if binding then
+			binding.Gui.Enabled = false
+		end
+		return
+	end
+
+	local eggDef, eggId = EggCatalog.GetEggDef(eggIdAny)
+	if not eggDef or not eggId then
+		local binding = previewByPrompt[prompt]
+		if binding then
+			binding.Gui.Enabled = false
+		end
+		return
+	end
+
+	local binding = ensurePreviewBinding(prompt)
+	local currentAdornee = prompt.Parent
+	if currentAdornee and currentAdornee:IsA("Attachment") then
+		currentAdornee = currentAdornee.Parent
+	end
+	local activeAdornee: BasePart? = nil
+	if currentAdornee and currentAdornee:IsA("BasePart") then
+		activeAdornee = currentAdornee
+	end
+	binding.Gui.Adornee = activeAdornee
+
+	local currencyName = tostring(eggDef.Price.Currency or "Coins")
+	local cost = math.max(0, math.floor(tonumber(eggDef.Price.Amount) or 0))
+	local coins, rubis = 0, 0
+	local okWallet, c, r = pcall(function()
+		return GetCurrencies:InvokeServer()
+	end)
+	if okWallet then
+		coins = math.max(0, math.floor(tonumber(c) or 0))
+		rubis = math.max(0, math.floor(tonumber(r) or 0))
+	end
+
+	local walletValue = (string.lower(currencyName) == "rubis") and rubis or coins
+	local affordable = walletValue >= cost
+	local costColor = affordable and Color3.fromRGB(170, 255, 190) or Color3.fromRGB(255, 150, 150)
+
+	if binding.TitleLabel then
+		binding.TitleLabel.Text = tostring(eggDef.DisplayName or eggId)
+	end
+	if binding.PriceLabel then
+		binding.PriceLabel.Text = string.format("Cost: %d %s  |  You: %d", cost, currencyName, walletValue)
+		binding.PriceLabel.TextColor3 = costColor
+	end
+
+	local slotCount = #binding.Slots
+	if slotCount <= 0 then
+		local fallback = tonumber(EggCatalog.Settings.PreviewSlotsFallback) or tonumber(EggCatalog.Settings.PreviewTopDrops) or 5
+		slotCount = math.max(1, math.floor(fallback))
+	end
+	local previewDrops = EggCatalog.GetPreviewEntries(eggId, slotCount)
+
+	for i, slot in ipairs(binding.Slots) do
+		local row = previewDrops[i]
+		if row then
+			slot.Root.Visible = true
+			setGuiObjectImage(slot.Icon, getPreviewPetIconId(row, eggDef.PreviewImageId), 0)
+
+			if slot.ChanceLabel then
+				local mode = string.lower(tostring(row.PowerMode or ""))
+				local tag = ""
+				if string.find(mode, "huge", 1, true) then
+					tag = " H"
+				elseif string.find(mode, "titanic", 1, true) then
+					tag = " T"
+				end
+				setGuiObjectText(slot.ChanceLabel, fmtChance(tonumber(row.ChancePercent) or 0) .. tag)
+				slot.ChanceLabel.Visible = true
+			end
+		else
+			slot.Root.Visible = false
+		end
+	end
+
+	binding.Gui.Enabled = true
+end
+
+local function hidePreviewIfPrompt(prompt: ProximityPrompt)
+	local binding = previewByPrompt[prompt]
+	if binding then
+		binding.Gui.Enabled = false
+		if not prompt:IsDescendantOf(game) then
+			binding.Gui:Destroy()
+			previewByPrompt[prompt] = nil
+		end
+	end
+	if activePrompt == prompt then
+		activePrompt = nil
+	end
+end
+
+local function playHatch(payload: HatchPayload)
+	local hatchCfg = payload.Hatch or EggCatalog.DefaultHatch
+	local flashTime = math.max(0.03, tonumber(hatchCfg.FlashTime) or tonumber(EggCatalog.DefaultHatch.FlashTime) or 0.12)
+	local holdResultTime = math.max(0.45, tonumber(hatchCfg.HoldResultTime) or tonumber(EggCatalog.DefaultHatch.HoldResultTime) or 1.15)
+	local fadeOutTime = math.max(0.08, tonumber(hatchCfg.FadeOutTime) or tonumber(EggCatalog.DefaultHatch.FadeOutTime) or 0.2)
+	local starStartY = tonumber(hatchCfg.StarStartY) or 1.26
+	local starEntrySize = math.max(140, tonumber(hatchCfg.StarEntrySize) or 300)
+	local starBurstSize = math.max(starEntrySize + 80, tonumber(hatchCfg.StarBurstSize) or 560)
+	local starImageId = normalizeImageId(hatchCfg.StarImageId)
+
+	local rarityColor = (typeof(payload.PetRarityColor) == "Color3") and payload.PetRarityColor or Color3.fromRGB(240, 240, 245)
+	local variantName = tostring(payload.PetVariant or "Normal")
+	local petLine = string.format("%s (%s)", tostring(payload.PetDisplayName or payload.PetName or "Pet"), variantName)
+	if payload.PetPowerMode == "Huge" then
+		petLine = petLine .. " [HUGE]"
+	elseif payload.PetPowerMode == "Titanic" then
+		petLine = petLine .. " [TITANIC]"
+	end
+
+	hatchOverlay.Visible = true
+	hatchOverlay.BackgroundTransparency = 1
+	hatchDim.Visible = true
+	hatchDim.BackgroundTransparency = 1
+
+	flash.Visible = false
+	flash.BackgroundTransparency = 1
+
+	hatchCard.Visible = false
+
+	starRoot.Visible = true
+	starRoot.Position = UDim2.fromScale(0.5, starStartY)
+	starRoot.Size = UDim2.fromOffset(starEntrySize, starEntrySize)
+	starRoot.Rotation = 0
+	starScale.Scale = 1
+
+	starMain.Image = starImageId
+	starDetailFront.Image = starImageId
+	starDetailBack.Image = starImageId
+	starMain.ImageColor3 = rarityColor
+	starMain.ImageTransparency = 0
+	starDetailFront.ImageColor3 = rarityColor:Lerp(Color3.new(1, 1, 1), 0.35)
+	starDetailFront.ImageTransparency = 0.34
+	starDetailBack.ImageColor3 = rarityColor:Lerp(Color3.new(1, 1, 1), 0.55)
+	starDetailBack.ImageTransparency = 0.56
+	starDetailFront.Rotation = 0
+	starDetailBack.Rotation = 0
+
+	revealEggImage.Visible = true
+	revealEggImage.Image = EggCatalog.NormalizeAssetId(payload.EggImageId)
+	revealEggImage.ImageTransparency = 0.02
+
+	revealPetImage.Visible = false
+	revealPetImage.Image = EggCatalog.NormalizeAssetId(payload.PetIconId)
+	revealPetImage.ImageTransparency = 1
+	revealPetScale.Scale = 0.72
+
+	revealName.Visible = true
+	revealName.Text = petLine
+	revealName.TextTransparency = 1
+	revealRarity.Visible = true
+	revealRarity.Text = string.upper(tostring(payload.PetRarity or "Common"))
+	revealRarity.TextColor3 = rarityColor
+	revealRarity.TextTransparency = 1
+
+	tween(hatchDim, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		BackgroundTransparency = 0.36,
+	})
+
+	local detailMotionActive = true
+	local detailStart = os.clock()
+	task.spawn(function()
+		while detailMotionActive and hatchOverlay.Visible do
+			RunService.RenderStepped:Wait()
+			local t = os.clock() - detailStart
+			starDetailFront.Rotation = t * 165
+			starDetailBack.Rotation = -t * 118
+			starScale.Scale = 1 + math.sin(t * 7.0) * 0.045
+			starDetailFront.ImageTransparency = 0.30 + ((math.sin(t * 8.0) + 1) * 0.5) * 0.17
+			starDetailBack.ImageTransparency = 0.50 + ((math.cos(t * 6.4) + 1) * 0.5) * 0.18
+		end
+	end)
+
+	tween(starRoot, TweenInfo.new(0.44, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+		Position = UDim2.fromScale(0.5, 0.56),
+	}).Completed:Wait()
+	tween(starRoot, TweenInfo.new(0.10, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Position = UDim2.fromScale(0.5, 0.49),
+	}).Completed:Wait()
+	tween(starRoot, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		Position = UDim2.fromScale(0.5, 0.5),
+	}).Completed:Wait()
+
+	local wiggles = {
+		{right = 10, left = -10, t = 0.065},
+		{right = 13, left = -13, t = 0.07},
+		{right = 22, left = -22, t = 0.085},
+	}
+	for _, w in ipairs(wiggles) do
+		tween(starRoot, TweenInfo.new(w.t, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {
+			Rotation = w.right,
+		}).Completed:Wait()
+		tween(starRoot, TweenInfo.new(w.t, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {
+			Rotation = w.left,
+		}).Completed:Wait()
+	end
+
+	flash.Visible = true
+	flash.BackgroundTransparency = 1
+	local flashIn = tween(flash, TweenInfo.new(flashTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		BackgroundTransparency = 0.08,
+	})
+	local flashOut = TweenService:Create(flash, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		BackgroundTransparency = 1,
+	})
+	detailMotionActive = false
+	tween(starRoot, TweenInfo.new(0.16, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Size = UDim2.fromOffset(starBurstSize, starBurstSize),
+		Rotation = 0,
+	})
+	tween(starMain, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		ImageTransparency = 1,
+	})
+	tween(starDetailFront, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		ImageTransparency = 1,
+	})
+	tween(starDetailBack, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		ImageTransparency = 1,
+	})
+	tween(revealEggImage, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		ImageTransparency = 1,
+	})
+	revealPetImage.Visible = true
+	tween(revealPetImage, TweenInfo.new(0.24, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		ImageTransparency = 0,
+	})
+	tween(revealPetScale, TweenInfo.new(0.24, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Scale = 1,
+	})
+	tween(revealName, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		TextTransparency = 0,
+	})
+	tween(revealRarity, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		TextTransparency = 0,
+	})
+	flashIn.Completed:Wait()
+	task.delay(0.055, function()
+		flashOut:Play()
+	end)
+
+	task.wait(holdResultTime)
+
+	tween(revealName, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		TextTransparency = 1,
+	})
+	tween(revealRarity, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		TextTransparency = 1,
+	})
+	tween(revealPetImage, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		ImageTransparency = 1,
+	})
+	local fadeDim = tween(hatchDim, TweenInfo.new(fadeOutTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		BackgroundTransparency = 1,
+	})
+	fadeDim.Completed:Wait()
+
+	resetHatchVisualState()
+end
+
+local function processQueue()
+	if playingHatch then
+		return
+	end
+	playingHatch = true
+	while #resultQueue > 0 do
+		local payload = table.remove(resultQueue, 1)
+		if payload then
+			local ok, err = pcall(playHatch, payload)
+			if not ok then
+				warn("[EggClient] playHatch failed:", tostring(err))
+				resetHatchVisualState()
+				showToast(false, "Falha na animacao do egg")
+			end
+		end
+	end
+	playingHatch = false
+end
+
+ProximityPromptService.PromptShown:Connect(function(prompt: ProximityPrompt)
+	if not prompt or not prompt:IsDescendantOf(workspace) then
+		return
+	end
+	local eggId = prompt:GetAttribute("EggId")
+	if typeof(eggId) ~= "string" or eggId == "" then
+		return
+	end
+	if activePrompt and activePrompt ~= prompt then
+		hidePreviewIfPrompt(activePrompt)
+	end
+	activePrompt = prompt
+	updatePreviewFromPrompt(prompt)
+end)
+
+ProximityPromptService.PromptHidden:Connect(function(prompt: ProximityPrompt)
+	hidePreviewIfPrompt(prompt)
+end)
+
+EggOpenFeedback.OnClientEvent:Connect(function(ok: boolean, message: string)
+	if ok == true then
+		return
+	end
+	local text = tostring(message or "")
+	if text == "" then
+		text = "Falha ao abrir egg"
+	end
+	showToast(false, text)
+end)
+
+EggOpenResult.OnClientEvent:Connect(function(payload: any)
+	if typeof(payload) ~= "table" then
+		return
+	end
+	table.insert(resultQueue, payload :: HatchPayload)
+	task.defer(processQueue)
+end)
