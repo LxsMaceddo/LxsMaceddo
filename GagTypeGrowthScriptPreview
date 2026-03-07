@@ -1,0 +1,1090 @@
+-- THIS IS ONLY 1 SCRIPT LOCATED IN SERVERSCRIPTSERVICE, BUT IT IS STILL THE MAIN SCRIPT THAT HANDLES ALMOST EVERYTHING IN THE GROWTH SYSTEM
+
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local Workspace = game:GetService("Workspace")
+
+local GrowthConfig = require(ReplicatedStorage:WaitForChild("GrowthConfig"))
+
+local function ensureFolder(parent: Instance, name: string): Folder
+	local existing = parent:FindFirstChild(name)
+	if existing and existing:IsA("Folder") then
+		return existing
+	end
+	if existing then
+		existing:Destroy()
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	folder.Parent = parent
+	return folder
+end
+
+local function ensureRemoteEvent(parent: Instance, name: string): RemoteEvent
+	local existing = parent:FindFirstChild(name)
+	if existing and existing:IsA("RemoteEvent") then
+		return existing
+	end
+	if existing then
+		existing:Destroy()
+	end
+
+	local remote = Instance.new("RemoteEvent")
+	remote.Name = name
+	remote.Parent = parent
+	return remote
+end
+
+local growablesFolder = ensureFolder(Workspace, GrowthConfig.GrowablesFolderName or "Growables")
+
+local modelStorageRootFolder = ensureFolder(
+	ServerStorage,
+	GrowthConfig.ModelStorageRootFolderName or "Assets"
+)
+local modelStorageFolder = ensureFolder(
+	modelStorageRootFolder,
+	GrowthConfig.ModelStorageFolderName or "Brainrots"
+)
+
+local seedTemplatesFolder = ensureFolder(ReplicatedStorage, "BrainrotSeeds")
+
+local growthRemotesFolder = ensureFolder(
+	ReplicatedStorage,
+	GrowthConfig.GrowthRemotesFolderName or "GrowthRemotes"
+)
+local spawnRequestRemote = ensureRemoteEvent(
+	growthRemotesFolder,
+	GrowthConfig.SpawnRequestRemoteName or "SpawnGrowableRequest"
+)
+
+local gameRemotesFolder = ensureFolder(ReplicatedStorage, "Remotes")
+local requestPlantSeedRemote = ensureRemoteEvent(
+	gameRemotesFolder,
+	GrowthConfig.PlantingRemoteName or "RequestPlantSeed"
+)
+
+type GrowthState = {
+	startScale: number,
+	finalScale: number,
+	growTime: number,
+	startedAt: number,
+	groundY: number,
+}
+
+local activeGrowth: {[Model]: GrowthState} = {}
+local warnedMissingConfig: {[string]: boolean} = {}
+local lastSpawnRequestAt: {[number]: number} = {}
+
+local function sanitizeScale(value: number): number
+	return math.clamp(value, 0.01, 100)
+end
+
+local function sanitizeGrowTime(value: number): number
+	return math.max(value, 0.05)
+end
+
+local function readNumberFromTable(source: {[string]: any}?, key: string, fallback: number): number
+	if source then
+		local value = source[key]
+		if typeof(value) == "number" then
+			return value
+		end
+	end
+	return fallback
+end
+
+local function readNumberAttribute(model: Model, attrName: string?, fallback: number): number
+	if not attrName then
+		return fallback
+	end
+
+	local attr = model:GetAttribute(attrName)
+	if typeof(attr) == "number" then
+		return attr
+	end
+	return fallback
+end
+
+local function ensurePrimaryPart(model: Model): BasePart?
+	if model.PrimaryPart and model.PrimaryPart.Parent then
+		return model.PrimaryPart
+	end
+
+	local firstPart = model:FindFirstChildWhichIsA("BasePart", true)
+	if firstPart then
+		model.PrimaryPart = firstPart
+	end
+	return firstPart
+end
+
+local function getModelBottomY(model: Model): number
+	local boundsCFrame, boundsSize = model:GetBoundingBox()
+	return boundsCFrame.Position.Y - (boundsSize.Y * 0.5)
+end
+
+local function keepModelBottomAt(model: Model, targetBottomY: number)
+	local currentBottomY = getModelBottomY(model)
+	local deltaY = targetBottomY - currentBottomY
+
+	if math.abs(deltaY) > 0.0001 then
+		model:PivotTo(model:GetPivot() + Vector3.new(0, deltaY, 0))
+	end
+end
+
+local function getSettingsForModelName(modelName: string): (number, number, number)
+	local defaults = GrowthConfig.Defaults or {}
+	local settingsByName = GrowthConfig.ModelSettingsByName or {}
+	local nameSettings = settingsByName[modelName]
+
+	local startScale = readNumberFromTable(defaults, "StartScale", 0.15)
+	local finalScale = readNumberFromTable(defaults, "FinalScale", 1)
+	local growTime = readNumberFromTable(defaults, "GrowTime", 120)
+
+	if nameSettings then
+		startScale = readNumberFromTable(nameSettings, "StartScale", startScale)
+		finalScale = readNumberFromTable(nameSettings, "FinalScale", finalScale)
+		growTime = readNumberFromTable(nameSettings, "GrowTime", growTime)
+	elseif not warnedMissingConfig[modelName] then
+		warnedMissingConfig[modelName] = true
+		warn(("Growth: missing config for '%s', using defaults."):format(modelName))
+	end
+
+	return sanitizeScale(startScale), sanitizeScale(finalScale), sanitizeGrowTime(growTime)
+end
+
+local function getSettingsForModel(model: Model): (number, number, number)
+	local startScale, finalScale, growTime = getSettingsForModelName(model.Name)
+
+	if GrowthConfig.AllowAttributeOverride then
+		local attrs = GrowthConfig.Attributes or {}
+		startScale = readNumberAttribute(model, attrs.StartScale, startScale)
+		finalScale = readNumberAttribute(model, attrs.FinalScale, finalScale)
+		growTime = readNumberAttribute(model, attrs.GrowTime, growTime)
+	end
+
+	return sanitizeScale(startScale), sanitizeScale(finalScale), sanitizeGrowTime(growTime)
+end
+
+local function normalizeOwnerName(ownerName: string): string
+	local trimmed = string.match(ownerName, "^%s*(.-)%s*$") or ""
+	local lowered = string.lower(trimmed)
+	if lowered == "" or lowered == "none" or lowered == "nil" or lowered == "unclaimed" or lowered == "nobody" or lowered == "noone" then
+		return ""
+	end
+	return trimmed
+end
+
+local function getPlotOwner(plot: Instance): string
+	local ownerAttr = plot:GetAttribute("Owner")
+	if typeof(ownerAttr) == "string" then
+		local normalized = normalizeOwnerName(ownerAttr)
+		if normalized ~= "" then
+			return normalized
+		end
+	end
+
+	local ownerChild = plot:FindFirstChild("Owner")
+	if ownerChild then
+		if ownerChild:IsA("StringValue") then
+			local normalized = normalizeOwnerName(ownerChild.Value)
+			if normalized ~= "" then
+				return normalized
+			end
+		end
+		if ownerChild:IsA("ObjectValue") and ownerChild.Value and ownerChild.Value:IsA("Player") then
+			return ownerChild.Value.Name
+		end
+	end
+
+	return ""
+end
+
+local function isPlotCandidate(instance: Instance): boolean
+	if not instance:IsA("Model") then
+		return false
+	end
+
+	local hasSpawnPart = instance:FindFirstChild("SpawnPart", true) ~= nil
+	local hasOwnerChild = instance:FindFirstChild("Owner") ~= nil
+	local ownerAttr = instance:GetAttribute("Owner")
+	local hasOwnerAttr = typeof(ownerAttr) == "string"
+	local isPlotByName = string.match(instance.Name, "^Plot") ~= nil
+
+	return hasSpawnPart or hasOwnerChild or hasOwnerAttr or isPlotByName
+end
+
+local function addPlotCandidate(instance: Instance, list: {Instance}, seen: {[Instance]: boolean})
+	if seen[instance] then
+		return
+	end
+	if not isPlotCandidate(instance) then
+		return
+	end
+
+	seen[instance] = true
+	table.insert(list, instance)
+end
+
+local function collectPlotCandidates(root: Instance?, list: {Instance}, seen: {[Instance]: boolean})
+	if not root then
+		return
+	end
+
+	for _, child in ipairs(root:GetChildren()) do
+		addPlotCandidate(child, list, seen)
+	end
+	for _, descendant in ipairs(root:GetDescendants()) do
+		addPlotCandidate(descendant, list, seen)
+	end
+end
+
+local function findMap(): Instance?
+	return Workspace:FindFirstChild("Map ")
+		or Workspace:FindFirstChild("Map")
+		or Workspace:FindFirstChild("Map ", true)
+		or Workspace:FindFirstChild("Map", true)
+end
+
+local function getAllPlots(): {Instance}
+	local plots: {Instance} = {}
+	local seen: {[Instance]: boolean} = {}
+	local map = findMap()
+
+	if map then
+		local mapPlots = map:FindFirstChild("Plots") or map:FindFirstChild("Plots", true)
+		collectPlotCandidates(mapPlots, plots, seen)
+		collectPlotCandidates(map, plots, seen)
+	end
+
+	local workspacePlots = Workspace:FindFirstChild("Plots") or Workspace:FindFirstChild("Plots", true)
+	collectPlotCandidates(workspacePlots, plots, seen)
+
+	if #plots == 0 then
+		collectPlotCandidates(Workspace, plots, seen)
+	end
+
+	return plots
+end
+
+local function getPlayerPlot(player: Player): Instance?
+	for _, plot in ipairs(getAllPlots()) do
+		if getPlotOwner(plot) == player.Name then
+			return plot
+		end
+	end
+
+	return nil
+end
+
+local function isPointInsidePlot(plot: Instance, worldPoint: Vector3): boolean
+	local plotCFrame: CFrame
+	local plotSize: Vector3
+
+	if plot:IsA("Model") then
+		plotCFrame, plotSize = plot:GetBoundingBox()
+	elseif plot:IsA("BasePart") then
+		plotCFrame = plot.CFrame
+		plotSize = plot.Size
+	else
+		return false
+	end
+
+	local localPoint = plotCFrame:PointToObjectSpace(worldPoint)
+
+	return math.abs(localPoint.X) <= plotSize.X * 0.5
+		and math.abs(localPoint.Z) <= plotSize.Z * 0.5
+		and localPoint.Y >= -10
+		and localPoint.Y <= plotSize.Y + 10
+end
+
+local function getHorizontalLook(vector: Vector3): Vector3
+	local horizontal = Vector3.new(vector.X, 0, vector.Z)
+	if horizontal.Magnitude < 0.001 then
+		return Vector3.new(0, 0, -1)
+	end
+	return horizontal.Unit
+end
+
+local function getCharacterHorizontalLook(character: Model?): Vector3
+	local humanoidRootPart = character and character:FindFirstChild("HumanoidRootPart")
+	if humanoidRootPart and humanoidRootPart:IsA("BasePart") then
+		return getHorizontalLook(humanoidRootPart.CFrame.LookVector)
+	end
+	return Vector3.new(0, 0, -1)
+end
+
+local function readRequestedSeedName(payload: any): string?
+	if typeof(payload) ~= "table" then
+		return nil
+	end
+
+	if typeof(payload.seedType) == "string" then
+		return payload.seedType
+	end
+	if typeof(payload.toolName) == "string" then
+		return payload.toolName
+	end
+	if typeof(payload.modelName) == "string" then
+		return payload.modelName
+	end
+
+	return nil
+end
+
+local function parseStackedSeedName(toolName: string): (string, number?)
+	local baseName, qtyText = string.match(toolName, "^(.-)%s*%((%d+)x%)$")
+	if baseName and qtyText then
+		local qty = tonumber(qtyText)
+		if qty then
+			return baseName, qty
+		end
+	end
+
+	return toolName, nil
+end
+
+local function getSeedBaseNameFromTool(tool: Tool): string
+	local seedBaseName = tool:GetAttribute("SeedBaseName")
+	if typeof(seedBaseName) == "string" and seedBaseName ~= "" then
+		return seedBaseName
+	end
+
+	local parsedBaseName = parseStackedSeedName(tool.Name)
+	return parsedBaseName
+end
+
+local function getSeedQuantityFromTool(tool: Tool): number
+	local seedQuantity = tool:GetAttribute("SeedQuantity")
+	if typeof(seedQuantity) == "number" and seedQuantity >= 1 then
+		return math.floor(seedQuantity)
+	end
+
+	local _, parsedQuantity = parseStackedSeedName(tool.Name)
+	if parsedQuantity and parsedQuantity >= 1 then
+		return parsedQuantity
+	end
+
+	return 1
+end
+
+local function setSeedToolState(tool: Tool, baseName: string, quantity: number, showQuantityInName: boolean)
+	local safeQuantity = math.max(1, math.floor(quantity))
+	tool:SetAttribute("IsSeed", true)
+	tool:SetAttribute("SeedBaseName", baseName)
+	tool:SetAttribute("SeedQuantity", safeQuantity)
+
+	if showQuantityInName then
+		tool.Name = ("%s (%dx)"):format(baseName, safeQuantity)
+	else
+		tool.Name = baseName
+	end
+
+	tool.ToolTip = ("Plant this seed (%dx)"):format(safeQuantity)
+end
+
+local function resolveToolToModel(tool: Tool, toolMap: {[string]: any}): (string?, string?)
+	local toolName = getSeedBaseNameFromTool(tool)
+	local mapped = toolMap[toolName]
+	if typeof(mapped) == "table" then
+		local modelName = mapped.ModelName
+		if typeof(modelName) == "string" and modelStorageFolder:FindFirstChild(modelName) then
+			local rewardToolName = mapped.RewardToolName
+			if typeof(rewardToolName) ~= "string" or rewardToolName == "" then
+				rewardToolName = modelName
+			end
+			return modelName, rewardToolName
+		end
+	end
+
+	if GrowthConfig.AllowDirectModelToolPlanting == true and modelStorageFolder:FindFirstChild(toolName) then
+		return toolName, toolName
+	end
+
+	local withoutSeedSuffix = toolName:gsub("%s+[Ss]eed$", "")
+	if withoutSeedSuffix ~= toolName and modelStorageFolder:FindFirstChild(withoutSeedSuffix) then
+		return withoutSeedSuffix, withoutSeedSuffix
+	end
+
+	return nil, nil
+end
+
+local function getUniqueToolName(backpack: Instance, baseName: string): string
+	if not backpack:FindFirstChild(baseName) then
+		return baseName
+	end
+
+	local index = 2
+	while true do
+		local candidate = ("%s #%d"):format(baseName, index)
+		if not backpack:FindFirstChild(candidate) then
+			return candidate
+		end
+		index += 1
+	end
+end
+
+local function resolvePlantingTool(player: Player, requestedName: string?): (Tool?, string?, string?)
+	local toolMap = GrowthConfig.PlantableToolMap or {}
+	local character = player.Character
+	if not character then
+		return nil, nil, nil
+	end
+
+	local equippedTool = character:FindFirstChildOfClass("Tool")
+	if not equippedTool then
+		return nil, nil, nil
+	end
+
+	local modelName, rewardToolName = resolveToolToModel(equippedTool, toolMap)
+	if not modelName then
+		return nil, nil, nil
+	end
+
+	if typeof(requestedName) == "string" and requestedName ~= "" then
+		local requestedBaseName = parseStackedSeedName(requestedName)
+		local requestedLower = string.lower(requestedBaseName)
+		local equippedToolBaseName = string.lower(getSeedBaseNameFromTool(equippedTool))
+		if equippedToolBaseName ~= requestedLower and string.lower(modelName) ~= requestedLower then
+			return nil, nil, nil
+		end
+	end
+
+	return equippedTool, modelName, rewardToolName
+end
+
+local function giveHarvestRewardTool(player: Player, rewardToolName: string)
+	local backpack = player:FindFirstChild("Backpack")
+	if not backpack then
+		return
+	end
+
+	local function ensureVisualHandle(tool: Tool)
+		tool.RequiresHandle = true
+		local handle = tool:FindFirstChild("Handle")
+		if handle and handle:IsA("BasePart") then
+			handle.CanCollide = false
+			handle.Massless = true
+			return
+		end
+
+		local generatedHandle = Instance.new("Part")
+		generatedHandle.Name = "Handle"
+		generatedHandle.Size = Vector3.new(1, 1, 1)
+		generatedHandle.Shape = Enum.PartType.Block
+		generatedHandle.Color = Color3.fromRGB(240, 200, 90)
+		generatedHandle.Material = Enum.Material.SmoothPlastic
+		generatedHandle.CanCollide = false
+		generatedHandle.Massless = true
+		generatedHandle.Parent = tool
+	end
+
+	local function equipInHand(tool: Tool)
+		local character = player.Character
+		if not character then
+			return
+		end
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			task.defer(function()
+				humanoid:EquipTool(tool)
+			end)
+		end
+	end
+
+	local brainrotGearFolder = ReplicatedStorage:FindFirstChild("BrainrotGear")
+	if brainrotGearFolder then
+		local template = brainrotGearFolder:FindFirstChild(rewardToolName)
+		if template and template:IsA("Tool") then
+			local clone = template:Clone()
+			clone.Name = getUniqueToolName(backpack, rewardToolName)
+			clone:SetAttribute("ItemBaseName", rewardToolName)
+			ensureVisualHandle(clone)
+			clone.Parent = backpack
+			equipInHand(clone)
+			return
+		end
+	end
+
+	local fallbackTool = Instance.new("Tool")
+	fallbackTool.Name = getUniqueToolName(backpack, rewardToolName)
+	fallbackTool.CanBeDropped = false
+	fallbackTool.ToolTip = rewardToolName
+	fallbackTool:SetAttribute("ItemBaseName", rewardToolName)
+	ensureVisualHandle(fallbackTool)
+
+	fallbackTool.Parent = backpack
+	equipInHand(fallbackTool)
+end
+
+local function attachHarvestClickDetector(model: Model)
+	if model:GetAttribute("CanHarvest") ~= true then
+		return
+	end
+
+	local harvestDistance = readNumberFromTable(GrowthConfig, "HarvestMaxDistance", 18)
+	local function isReadyToHarvest(target: Model): boolean
+		return target:GetAttribute("IsMature") == true or target:GetAttribute("GrowthState") == "Mature"
+	end
+
+	local function tryHarvest(player: Player)
+		if model:GetAttribute("Harvested") == true then
+			return
+		end
+
+		if not isReadyToHarvest(model) then
+			return
+		end
+
+		local ownerUserId = model:GetAttribute("OwnerUserId")
+		if typeof(ownerUserId) == "number" and ownerUserId ~= player.UserId then
+			return
+		end
+
+		model:SetAttribute("Harvested", true)
+
+		local rewardToolName = model:GetAttribute("RewardToolName")
+		if typeof(rewardToolName) ~= "string" or rewardToolName == "" then
+			rewardToolName = model.Name
+		end
+		giveHarvestRewardTool(player, rewardToolName)
+
+		activeGrowth[model] = nil
+		model:Destroy()
+	end
+
+	local foundPart = false
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			foundPart = true
+
+			local clickDetector = descendant:FindFirstChildOfClass("ClickDetector")
+			if not clickDetector then
+				clickDetector = Instance.new("ClickDetector")
+				clickDetector.Parent = descendant
+			end
+
+			clickDetector.MaxActivationDistance = harvestDistance
+			clickDetector.MouseClick:Connect(tryHarvest)
+		end
+	end
+
+	if not foundPart then
+		warn(("Growth: '%s' has no clickable part for harvest."):format(model:GetFullName()))
+	end
+end
+
+local function beginGrowth(model: Model)
+	if activeGrowth[model] then
+		return
+	end
+
+	local primaryPart = ensurePrimaryPart(model)
+	if not primaryPart then
+		warn(("Growth: '%s' has no BasePart, skipping."):format(model:GetFullName()))
+		return
+	end
+
+	attachHarvestClickDetector(model)
+
+	local groundY = getModelBottomY(model)
+	local startScale, finalScale, growTime = getSettingsForModel(model)
+
+	model:ScaleTo(startScale)
+	keepModelBottomAt(model, groundY)
+
+	model:SetAttribute("CurrentAge", 0)
+	model:SetAttribute("MaxAge", growTime)
+	model:SetAttribute("GrowthPercent", 0)
+	model:SetAttribute("IsMature", false)
+	model:SetAttribute("GrowthState", "Growing")
+
+	activeGrowth[model] = {
+		startScale = startScale,
+		finalScale = finalScale,
+		growTime = growTime,
+		startedAt = os.clock(),
+		groundY = groundY,
+	}
+end
+
+local function tryRegisterGrowable(child: Instance)
+	if not child:IsA("Model") then
+		return
+	end
+	beginGrowth(child)
+end
+
+local function setModelAnchored(model: Model, anchored: boolean)
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			descendant.Anchored = anchored
+		end
+	end
+end
+
+local function getSpawnTemplateModel(): Model?
+	local forcedModelName = GrowthConfig.TestSpawnModelName
+	if typeof(forcedModelName) == "string" and forcedModelName ~= "" then
+		local forcedTemplate = modelStorageFolder:FindFirstChild(forcedModelName)
+		if forcedTemplate and forcedTemplate:IsA("Model") then
+			return forcedTemplate
+		end
+		warn(("Growth: test model '%s' was not found in %s."):format(forcedModelName, modelStorageFolder:GetFullName()))
+	end
+
+	local function createFallbackTemplate(): Model
+		local fallbackModel = Instance.new("Model")
+		fallbackModel.Name = "__FallbackGrowable"
+
+		local mainPart = Instance.new("Part")
+		mainPart.Name = "Main"
+		mainPart.Size = Vector3.new(3, 3, 3)
+		mainPart.Anchored = true
+		mainPart.Material = Enum.Material.Grass
+		mainPart.Color = Color3.fromRGB(90, 170, 80)
+		mainPart.Parent = fallbackModel
+
+		local topPart = Instance.new("Part")
+		topPart.Name = "Top"
+		topPart.Size = Vector3.new(1.5, 1.5, 1.5)
+		topPart.Anchored = true
+		topPart.Material = Enum.Material.SmoothPlastic
+		topPart.Color = Color3.fromRGB(210, 70, 70)
+		topPart.CFrame = mainPart.CFrame * CFrame.new(0, 2, 0)
+		topPart.Parent = fallbackModel
+
+		fallbackModel.PrimaryPart = mainPart
+		fallbackModel.Parent = modelStorageFolder
+		return fallbackModel
+	end
+
+	local templates = {}
+	for _, child in ipairs(modelStorageFolder:GetChildren()) do
+		if child:IsA("Model") and child:FindFirstChildWhichIsA("BasePart", true) then
+			table.insert(templates, child)
+		end
+	end
+
+	if #templates == 0 then
+		warn(("Growth: no model found in %s, creating a fallback one."):format(modelStorageFolder:GetFullName()))
+		return createFallbackTemplate()
+	end
+
+	return templates[math.random(1, #templates)]
+end
+
+local function getSpawnCFrame(player: Player, model: Model): CFrame
+	local character = player.Character
+	local humanoidRootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+	local spawnDistance = readNumberFromTable(GrowthConfig, "TestSpawnDistance", 10)
+	local rayHeight = readNumberFromTable(GrowthConfig, "SpawnRayHeight", 120)
+	local rayLength = readNumberFromTable(GrowthConfig, "SpawnRayLength", 500)
+
+	if not humanoidRootPart or not humanoidRootPart:IsA("BasePart") then
+		local _, modelSize = model:GetBoundingBox()
+		return CFrame.new(0, 5 + (modelSize.Y * 0.5), 0)
+	end
+
+	local horizontalForward = getCharacterHorizontalLook(character)
+
+	local centerPosition = humanoidRootPart.Position + (horizontalForward * spawnDistance)
+	local groundY = centerPosition.Y
+
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = {character}
+
+	local rayOrigin = centerPosition + Vector3.new(0, rayHeight, 0)
+	local rayDirection = Vector3.new(0, -rayLength, 0)
+	local raycastResult = Workspace:Raycast(rayOrigin, rayDirection, raycastParams)
+	if raycastResult then
+		groundY = raycastResult.Position.Y
+	end
+
+	local _, modelSize = model:GetBoundingBox()
+	local spawnPosition = Vector3.new(centerPosition.X, groundY + (modelSize.Y * 0.5), centerPosition.Z)
+	return CFrame.lookAt(spawnPosition, spawnPosition + horizontalForward)
+end
+
+local function spawnTestGrowable(player: Player)
+	local template = getSpawnTemplateModel()
+	if not template then
+		return
+	end
+
+	local clone = template:Clone()
+	setModelAnchored(clone, true)
+	clone:SetAttribute("CanHarvest", true)
+	clone:SetAttribute("Harvested", false)
+	clone:SetAttribute("OwnerUserId", player.UserId)
+	clone:SetAttribute("RewardToolName", template.Name)
+	clone:PivotTo(getSpawnCFrame(player, clone))
+	clone.Parent = growablesFolder
+end
+
+local function getAvailableSeedNames(): {string}
+	local result = {}
+	local seen: {[string]: boolean} = {}
+	local toolMap = GrowthConfig.PlantableToolMap or {}
+
+	for toolName in pairs(toolMap) do
+		if typeof(toolName) == "string" and toolName ~= "" and not seen[toolName] then
+			seen[toolName] = true
+			table.insert(result, toolName)
+		end
+	end
+
+	if #result == 0 then
+		for _, child in ipairs(modelStorageFolder:GetChildren()) do
+			if child:IsA("Model") then
+				local fallbackSeedName = ("%s Seed"):format(child.Name)
+				if not seen[fallbackSeedName] then
+					seen[fallbackSeedName] = true
+					table.insert(result, fallbackSeedName)
+				end
+			end
+		end
+	end
+
+	return result
+end
+
+local function createSeedTemplate(seedName: string): Tool
+	local seedTool = Instance.new("Tool")
+	seedTool.Name = seedName
+	seedTool.ToolTip = "Plant this seed"
+	seedTool.RequiresHandle = true
+	seedTool.CanBeDropped = false
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Shape = Enum.PartType.Ball
+	handle.Size = Vector3.new(1, 1, 1)
+	handle.Color = Color3.fromRGB(244, 204, 120)
+	handle.Material = Enum.Material.SmoothPlastic
+	handle.CanCollide = false
+	handle.Massless = true
+	handle.Parent = seedTool
+	setSeedToolState(seedTool, seedName, 1, false)
+
+	return seedTool
+end
+
+local function collectSeedToolsInContainer(container: Instance?, baseName: string): {Tool}
+	local result = {}
+	if not container then
+		return result
+	end
+
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Tool") and getSeedBaseNameFromTool(child) == baseName then
+			table.insert(result, child)
+		end
+	end
+
+	return result
+end
+
+local function collectPlayerSeedTools(player: Player, baseName: string): {Tool}
+	local result = {}
+
+	for _, tool in ipairs(collectSeedToolsInContainer(player.Character, baseName)) do
+		table.insert(result, tool)
+	end
+
+	for _, tool in ipairs(collectSeedToolsInContainer(player:FindFirstChild("Backpack"), baseName)) do
+		table.insert(result, tool)
+	end
+
+	return result
+end
+
+local function sumSeedToolsQuantity(tools: {Tool}): number
+	local total = 0
+	for _, tool in ipairs(tools) do
+		total += getSeedQuantityFromTool(tool)
+	end
+	return total
+end
+
+local function setStarterGearSeedQuantity(player: Player, baseName: string, quantity: number, template: Tool?)
+	local starterGear = player:FindFirstChild("StarterGear")
+	if not starterGear then
+		return
+	end
+
+	local starterTools = collectSeedToolsInContainer(starterGear, baseName)
+	if quantity <= 0 then
+		for _, tool in ipairs(starterTools) do
+			tool:Destroy()
+		end
+		return
+	end
+
+	local keepTool = starterTools[1]
+	if not keepTool then
+		keepTool = (template and template:Clone()) or createSeedTemplate(baseName)
+		keepTool.Parent = starterGear
+	end
+
+	setSeedToolState(keepTool, baseName, quantity, true)
+
+	for i = 2, #starterTools do
+		starterTools[i]:Destroy()
+	end
+end
+
+local function setPlayerSeedQuantity(player: Player, baseName: string, quantity: number, template: Tool?, preferredTool: Tool?): Tool?
+	local playerTools = collectPlayerSeedTools(player, baseName)
+
+	if quantity <= 0 then
+		for _, tool in ipairs(playerTools) do
+			tool:Destroy()
+		end
+		setStarterGearSeedQuantity(player, baseName, 0, template)
+		return nil
+	end
+
+	local keepTool: Tool? = nil
+	if preferredTool and preferredTool.Parent and getSeedBaseNameFromTool(preferredTool) == baseName then
+		keepTool = preferredTool
+	end
+
+	if not keepTool then
+		keepTool = playerTools[1]
+	end
+
+	if not keepTool then
+		local backpack = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack", 5)
+		if not backpack then
+			return nil
+		end
+		keepTool = (template and template:Clone()) or createSeedTemplate(baseName)
+		keepTool.Parent = backpack
+	end
+
+	setSeedToolState(keepTool, baseName, quantity, true)
+
+	for _, tool in ipairs(playerTools) do
+		if tool ~= keepTool then
+			tool:Destroy()
+		end
+	end
+
+	setStarterGearSeedQuantity(player, baseName, quantity, template)
+	return keepTool
+end
+
+local function addSeedToPlayer(player: Player, seedName: string, amount: number, template: Tool?): Tool?
+	if amount <= 0 then
+		return nil
+	end
+
+	local existingTools = collectPlayerSeedTools(player, seedName)
+	local newQuantity = sumSeedToolsQuantity(existingTools) + amount
+	local keepTool = setPlayerSeedQuantity(player, seedName, newQuantity, template, existingTools[1])
+	if not keepTool then
+		return nil
+	end
+
+	local character = player.Character
+	if character then
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid:EquipTool(keepTool)
+		end
+	end
+
+	return keepTool
+end
+
+local function consumeOneSeedFromTool(player: Player, tool: Tool)
+	local baseName = getSeedBaseNameFromTool(tool)
+	local existingTools = collectPlayerSeedTools(player, baseName)
+	local currentQuantity = sumSeedToolsQuantity(existingTools)
+	if currentQuantity <= 0 then
+		return
+	end
+
+	setPlayerSeedQuantity(player, baseName, currentQuantity - 1, nil, tool)
+end
+
+local function ensureSeedTemplates()
+	for _, seedName in ipairs(getAvailableSeedNames()) do
+		local existing = seedTemplatesFolder:FindFirstChild(seedName)
+		if existing and existing:IsA("Tool") then
+			local handle = existing:FindFirstChild("Handle")
+			if handle and handle:IsA("BasePart") then
+				continue
+			end
+			existing:Destroy()
+		elseif existing then
+			existing:Destroy()
+		end
+
+		local template = createSeedTemplate(seedName)
+		template.Parent = seedTemplatesFolder
+	end
+end
+
+local function findSeedTemplate(seedName: string): Tool?
+	local searchContainers = {}
+	local function addContainer(name: string)
+		local container = ReplicatedStorage:FindFirstChild(name)
+		if container then
+			table.insert(searchContainers, container)
+		end
+	end
+
+	addContainer("BrainrotSeeds")
+	addContainer("Seeds")
+	addContainer("Tools")
+	addContainer("Items")
+	addContainer("BrainrotGear")
+
+	for _, container in ipairs(searchContainers) do
+		if container then
+			local template = container:FindFirstChild(seedName)
+			if template and template:IsA("Tool") then
+				return template
+			end
+		end
+	end
+
+	local directTemplate = ReplicatedStorage:FindFirstChild(seedName)
+	if directTemplate and directTemplate:IsA("Tool") then
+		return directTemplate
+	end
+
+	return nil
+end
+
+local function giveRandomSeed(player: Player)
+	ensureSeedTemplates()
+
+	local seedNames = getAvailableSeedNames()
+	if #seedNames == 0 then
+		warn("Growth: no seed available for test mode.")
+		return
+	end
+
+	local selectedSeed = seedNames[math.random(1, #seedNames)]
+
+	local template = findSeedTemplate(selectedSeed)
+	local givenTool = addSeedToPlayer(player, selectedSeed, 1, template)
+	if not givenTool then
+		warn(("Growth: could not give seed to %s."):format(player.Name))
+	end
+end
+
+for _, child in ipairs(growablesFolder:GetChildren()) do
+	tryRegisterGrowable(child)
+end
+
+growablesFolder.ChildAdded:Connect(function(child)
+	task.defer(tryRegisterGrowable, child)
+end)
+
+requestPlantSeedRemote.OnServerEvent:Connect(function(player: Player, payload)
+	local position = payload and payload.position
+	if typeof(position) ~= "Vector3" then
+		return
+	end
+
+	local requestedName = readRequestedSeedName(payload)
+
+	local playerPlot = getPlayerPlot(player)
+	if GrowthConfig.RequireOwnedPlot and (not playerPlot or not isPointInsidePlot(playerPlot, position)) then
+		return
+	end
+
+	local plantingTool, modelName, rewardToolName = resolvePlantingTool(player, requestedName)
+	if not plantingTool or not modelName then
+		return
+	end
+
+	local template = modelStorageFolder:FindFirstChild(modelName)
+	if not template or not template:IsA("Model") then
+		return
+	end
+
+	local startScale, finalScale, growTime = getSettingsForModelName(modelName)
+
+	local clone = template:Clone()
+	setModelAnchored(clone, true)
+
+	clone:SetAttribute("CanHarvest", true)
+	clone:SetAttribute("Harvested", false)
+	clone:SetAttribute("OwnerUserId", player.UserId)
+	clone:SetAttribute("RewardToolName", rewardToolName or modelName)
+	clone:SetAttribute("StartScale", startScale)
+	clone:SetAttribute("FinalScale", finalScale)
+	clone:SetAttribute("GrowTime", growTime)
+
+	local lookDirection = getCharacterHorizontalLook(player.Character)
+
+	local _, modelSize = clone:GetBoundingBox()
+	local plantedPosition = Vector3.new(position.X, position.Y + (modelSize.Y * 0.5), position.Z)
+	clone:PivotTo(CFrame.lookAt(plantedPosition, plantedPosition + lookDirection))
+	clone.Parent = growablesFolder
+
+	consumeOneSeedFromTool(player, plantingTool)
+end)
+
+spawnRequestRemote.OnServerEvent:Connect(function(player: Player)
+	local cooldown = readNumberFromTable(GrowthConfig, "TestSpawnCooldown", 0.25)
+	local now = os.clock()
+	local lastRequest = lastSpawnRequestAt[player.UserId] or 0
+
+	if now - lastRequest < cooldown then
+		return
+	end
+
+	lastSpawnRequestAt[player.UserId] = now
+	local testActionMode = GrowthConfig.TestActionMode
+	if testActionMode == "SpawnGrowable" then
+		spawnTestGrowable(player)
+		return
+	end
+
+	giveRandomSeed(player)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	lastSpawnRequestAt[player.UserId] = nil
+end)
+
+while true do
+	local now = os.clock()
+
+	for model, state in pairs(activeGrowth) do
+		if not model.Parent then
+			activeGrowth[model] = nil
+			continue
+		end
+
+		local age = now - state.startedAt
+		local alpha = math.clamp(age / state.growTime, 0, 1)
+		local currentScale = state.startScale + ((state.finalScale - state.startScale) * alpha)
+		local growthPercent = alpha * 100
+
+		model:ScaleTo(currentScale)
+		keepModelBottomAt(model, state.groundY)
+		model:SetAttribute("CurrentAge", math.min(age, state.growTime))
+		model:SetAttribute("GrowthPercent", growthPercent)
+
+		if alpha >= 1 then
+			model:SetAttribute("CurrentAge", state.growTime)
+			model:SetAttribute("GrowthPercent", 100)
+			model:SetAttribute("IsMature", true)
+			model:SetAttribute("GrowthState", "Mature")
+			activeGrowth[model] = nil
+		end
+	end
+
+	task.wait(GrowthConfig.UpdateInterval or 0.05)
+end
